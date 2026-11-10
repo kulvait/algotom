@@ -39,7 +39,63 @@ from scipy import interpolate
 from scipy.ndimage import shift
 import algotom.prep.removal as remo
 import algotom.prep.calculation as calc
+import logging
 
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Helper functions for sub-pixel shifting (used by enhanced stitching)
+# ---------------------------------------------------------------------------
+def shiftFrame(x: np.ndarray, shiftSize: int) -> np.ndarray:
+    """Integer shift with zero-padding (not circular)."""
+    if shiftSize == 0:
+        return x
+    f = np.roll(x, [0, shiftSize])
+    if shiftSize > 0: 
+        f[:, :shiftSize] = 0.0
+    else:  # negative
+        f[:, shiftSize:] = 0.0
+    return f
+
+
+def shiftFrameFloat(f: np.ndarray, shiftSize: float, log_interpolate: bool = True) -> np.ndarray:
+    """
+    Float shift using linear interpolation between integer shifts.
+
+    Note: The log-space interpolation (log(exp(f1)*w + exp(f2)*(1-w))) is
+    intended for log-transformed data (e.g., extinction sinograms). For
+    linear data, the commented linear interpolation is more appropriate.
+    """
+    intShift = int(np.floor(shiftSize))
+    floatShift = shiftSize - intShift
+    f1 = shiftFrame(f, intShift)
+    f2 = shiftFrame(f, intShift + 1) 
+    if log_interpolate:
+        # Log-space interpolation: appropriate for log-transformed (extinction) data
+        return np.log(np.exp(f1) * (1.0 - floatShift) + np.exp(f2) * floatShift)
+    else:
+        # Linear interpolation (for non-log data):
+        return f1 * (1.0 - floatShift) + f2 * floatShift
+
+def visualize_sinogram(sino, title='Stitched Sinogram'):
+    """ 
+    Visualize a sinogram using matplotlib.
+
+    Parameters
+    ----------
+    sino : array_like
+        2D array representing the sinogram.
+    title : str, optional
+        Title of the plot.
+    """
+    import matplotlib.pyplot as plt 
+    plt.figure(figsize=(10, 5)) 
+    plt.imshow(sino, cmap='gray', aspect='auto')
+    plt.title(title)
+    plt.xlabel('Detector pixel')
+    plt.ylabel('Projection angle')
+    plt.colorbar(label='Intensity')
+    plt.show()
 
 def make_weight_matrix(mat1, mat2, overlap, side):
     """
@@ -75,7 +131,7 @@ def make_weight_matrix(mat1, mat2, overlap, side):
 
 
 def stitch_image(mat1, mat2, overlap, side, wei_mat1=None, wei_mat2=None,
-                 norm=True, norm_per_row=False, total_width=None):
+                 norm=True, norm_per_row=False, total_width=None, noweighting=False, log_interpolate=True):
     """
     Stitch projection images or sinogram images using a linear ramp.
 
@@ -101,6 +157,10 @@ def stitch_image(mat1, mat2, overlap, side, wei_mat1=None, wei_mat2=None,
         Enable/disable normalization row-by-row if norm is True.
     total_width : int, optional
         Final width of the stitched image.
+    noweighting : bool, optional
+        Skip weighting matrices, use uniform weights. Otherwise, weighting matrices are generated automatically by make_weight_matrix() which creates a linear ramp in the overlap region where the weights transition from 1 to 0 from inside to edge of the overlap region.
+    log_interpolate : bool, optional
+        Use log-space interpolation for sub-pixel shifts (appropriate for log-transformed data). If False, linear interpolation is used.
 
     Returns
     -------
@@ -109,20 +169,26 @@ def stitch_image(mat1, mat2, overlap, side, wei_mat1=None, wei_mat2=None,
     """
     (nrow1, ncol1) = mat1.shape
     (nrow2, ncol2) = mat2.shape
-    overlap_int = int(np.round(overlap + 1.0e-3))
+    overlap_int = int(np.floor(overlap))
     sub_pixel = overlap - overlap_int
-    if sub_pixel != 0.0:
+    if sub_pixel > 0.0:
+        #For proper alignment each part is shifted by half of the sub-pixel overlap so that overlap is reduced to overlap_int
+        sub_pixel_shift = sub_pixel/2.0
         if side == 1:
-            mat1 = shift(mat1, (0, sub_pixel), mode='nearest')
-            mat2 = shift(mat2, (0, -sub_pixel), mode='nearest')
+            mat1 = shiftFrameFloat(mat1, sub_pixel_shift, log_interpolate=log_interpolate)
+            mat2 = shiftFrameFloat(mat2, -sub_pixel_shift, log_interpolate=log_interpolate)
         else:
-            mat1 = shift(mat1, (0, -sub_pixel), mode='nearest')
-            mat2 = shift(mat2, (0, sub_pixel), mode='nearest')
+            log.info("Shift mat1 by -sub_pixel_shift=%f and mat2 by sub_pixel_shift=%f", -sub_pixel_shift, sub_pixel_shift)
+            mat1 = shiftFrameFloat(mat1, -sub_pixel_shift, log_interpolate=log_interpolate)
+            mat2 = shiftFrameFloat(mat2, sub_pixel_shift, log_interpolate=log_interpolate)
     if nrow1 != nrow2:
         raise ValueError("Two images are not at the same height!!!")
-    if (wei_mat1 is None) or (wei_mat2 is None):
-        (wei_mat1, wei_mat2) = make_weight_matrix(mat1, mat2,
-                                                  overlap_int, side)
+    if noweighting:
+        wei_mat1 = np.ones_like(mat1)
+        wei_mat2 = np.ones_like(mat2)
+    elif (wei_mat1 is None) or (wei_mat2 is None):
+        wei_mat1, wei_mat2 = make_weight_matrix(mat1, mat2, overlap_int, side)
+
     total_width0 = ncol1 + ncol2 - overlap_int
     if (total_width is None) or (total_width < total_width0):
         total_width = total_width0
@@ -159,7 +225,8 @@ def stitch_image(mat1, mat2, overlap, side, wei_mat1=None, wei_mat2=None,
     return mat_comb
 
 
-def join_image(mat1, mat2, joint_width, side, norm=True, total_width=None):
+def join_image(mat1, mat2, joint_width, side, norm=True, total_width=None,
+               interpolate_gap=True, log_interpolate=True):
     """
     Join projection images or sinogram images. This is useful for fixing the
     problem of non-overlap between images.
@@ -168,18 +235,24 @@ def join_image(mat1, mat2, joint_width, side, norm=True, total_width=None):
     ----------
     mat1 : array_like
         2D array. Projection image or sinogram image.
-    mat2 :  array_like
+    mat2 : array_like
         2D array. Projection image or sinogram image.
     joint_width : float
-        Width of the joint area between two images.
+        Width of the gap between two images.
     side : {0, 1}
-        Only two options: 0 or 1. It is used to indicate the overlap side
-        respects to image 1. "0" corresponds to the left side. "1" corresponds
-        to the right side.
-    norm : bool
+        Indicates the overlap side with respect to image 1.
+        0 corresponds to the left side, 1 to the right side.
+    norm : bool, optional
         Enable/disable normalization before joining.
     total_width : int, optional
         Final width of the joined image.
+    interpolate_gap : bool, optional
+        If True, interpolate across the joint/gap region using
+        bilinear splines (RectBivariateSpline).
+        If False, leave the gap as zeros.
+    log_interpolate : bool, optional
+        Use log-space interpolation for sub-pixel shifts.
+        If False, linear interpolation is used.
 
     Returns
     -------
@@ -188,70 +261,139 @@ def join_image(mat1, mat2, joint_width, side, norm=True, total_width=None):
     """
     (nrow1, ncol1) = mat1.shape
     (nrow2, ncol2) = mat2.shape
-    joint_int = int(np.round(joint_width + 1.0e-3))
-    sub_pixel = joint_width - joint_int
+
+    # Validate inputs
     side = int(side)
-    if sub_pixel != 0.0:
-        if side == 1:
-            mat1 = shift(mat1, (0, sub_pixel), mode='nearest')
-            mat2 = shift(mat2, (0, -sub_pixel), mode='nearest')
-        else:
-            mat1 = shift(mat1, (0, -sub_pixel), mode='nearest')
-            mat2 = shift(mat2, (0, sub_pixel), mode='nearest')
+    if side not in (0, 1):
+        raise ValueError("side must be either 0 or 1.")
+
     if nrow1 != nrow2:
-        raise ValueError("Two images are not at the same height!!!")
-    total_width0 = ncol1 + ncol2 + joint_int
-    if (total_width is None) or (total_width < total_width0):
+        raise ValueError("Two images are not at the same height!")
+
+    # Calculate integer and sub-pixel gap widths
+    gap_width = joint_width
+    gap_int = int(np.floor(gap_width))
+    sub_pixel = gap_width - gap_int
+
+    # Apply sub-pixel shifts for proper alignment
+    if sub_pixel > 0.0:
+        sub_pixel_shift = sub_pixel / 2.0
+
+        if side == 1:
+            mat1 = shiftFrameFloat(
+                mat1, sub_pixel_shift,
+                log_interpolate=log_interpolate
+            )
+            mat2 = shiftFrameFloat(
+                mat2, -sub_pixel_shift,
+                log_interpolate=log_interpolate
+            )
+        else:
+            log.info(
+                "Shift mat1 by -sub_pixel_shift=%f and "
+                "mat2 by sub_pixel_shift=%f",
+                -sub_pixel_shift, sub_pixel_shift
+            )
+            mat1 = shiftFrameFloat(
+                mat1, -sub_pixel_shift,
+                log_interpolate=log_interpolate
+            )
+            mat2 = shiftFrameFloat(
+                mat2, sub_pixel_shift,
+                log_interpolate=log_interpolate
+            )
+
+    # Calculate output width
+    total_width0 = ncol1 + ncol2 + gap_int
+
+    if total_width is None or total_width < total_width0:
         total_width = total_width0
-    mat_comb = np.zeros((nrow1, total_width0), dtype=np.float32)
+
+    mat_comb = np.zeros(
+        (nrow1, total_width0), dtype=np.float32
+    )
+
+    # Place images and normalize their intensities
     if side == 1:
-        if norm is True:
+
+        if norm:
             factor1 = np.mean(mat1[:, -3:])
             factor2 = np.mean(mat2[:, :3])
             mat2 = mat2 * factor1 / factor2
-        mat_comb[:, 0:ncol1] = mat1
-        mat_comb[:, (ncol1 + joint_int):total_width0] += mat2
-        list_mask = np.zeros(total_width0, dtype=np.float32)
-        list_mask[ncol1 - 2:ncol1 + joint_int + 3] = 1.0
-        xlist = np.where(list_mask < 1.0)[0]
-        ylist = np.arange(nrow1)
-        finter = interpolate.RectBivariateSpline(ylist, xlist,
-                                                 mat_comb[:, xlist],
-                                                 kx=1, ky=1)
-        xlist_miss = np.where(list_mask > 0.0)[0]
-        if len(xlist_miss) > 0:
-            x_mat_miss, y_mat = np.meshgrid(xlist_miss, ylist)
-            output = finter.ev(np.ndarray.flatten(y_mat),
-                               np.ndarray.flatten(x_mat_miss))
-            mat_comb[:, xlist_miss] = output.reshape(x_mat_miss.shape)
+
+        mat_comb[:, :ncol1] = mat1
+        mat_comb[:, ncol1 + gap_int:] = mat2
+
+        gap_start = ncol1
+
     else:
-        if norm is True:
+
+        if norm:
             factor2 = np.mean(mat2[:, -3:])
             factor1 = np.mean(mat1[:, :3])
             mat2 = mat2 * factor1 / factor2
-        mat_comb[:, 0:ncol2] = mat2
-        mat_comb[:, (ncol2 + joint_int):total_width0] += mat1
+
+        mat_comb[:, :ncol2] = mat2
+        mat_comb[:, ncol2 + gap_int:] = mat1
+
+        gap_start = ncol2
+
+    # Interpolate across the gap
+    if interpolate_gap:
+
+        # Include gap + 2 pixels on each side for better interpolation
         list_mask = np.zeros(total_width0, dtype=np.float32)
-        list_mask[ncol2 - 2:ncol2 + joint_int + 3] = 1.0
+
+        list_mask[
+            max(0, gap_start - 2):
+            min(total_width0, gap_start + gap_int + 3)
+        ] = 1.0
+
         xlist = np.where(list_mask < 1.0)[0]
-        ylist = np.arange(nrow1)
-        finter = interpolate.RectBivariateSpline(ylist, xlist,
-                                                 mat_comb[:, xlist],
-                                                 kx=1, ky=1)
         xlist_miss = np.where(list_mask > 0.0)[0]
-        if len(xlist_miss) > 0:
+        ylist = np.arange(nrow1)
+
+        if len(xlist) > 1 and len(ylist) > 1 and len(xlist_miss) > 0:
+
+            finter = interpolate.RectBivariateSpline(
+                ylist,
+                xlist,
+                mat_comb[:, xlist],
+                kx=1,
+                ky=1
+            )
+
             x_mat_miss, y_mat = np.meshgrid(xlist_miss, ylist)
-            output = finter.ev(np.ndarray.flatten(y_mat),
-                               np.ndarray.flatten(x_mat_miss))
-            mat_comb[:, xlist_miss] = output.reshape(x_mat_miss.shape)
+
+            output = finter.ev(
+                np.ndarray.flatten(y_mat),
+                np.ndarray.flatten(x_mat_miss)
+            )
+
+            mat_comb[:, xlist_miss] = output.reshape(
+                x_mat_miss.shape
+            )
+
+        else:
+            log.warning(
+                "Not enough points for interpolation across the "
+                "gap region. Skipping interpolation."
+            )
+
+    # Pad output to requested total width
     if total_width > total_width0:
         mat_comb = np.pad(
-            mat_comb, ((0, 0), (0, total_width - total_width0)), mode='edge')
+            mat_comb,
+            ((0, 0), (0, total_width - total_width0)),
+            mode='edge'
+        )
+
     return mat_comb
 
 
 def stitch_image_multiple(list_mat, list_overlap, norm=True,
-                          norm_per_row=False, total_width=None):
+                          norm_per_row=False, total_width=None,
+                          log_interpolate=True, noweighting=False):
     """
     Stitch list of projection images or sinogram images using a linear ramp.
 
@@ -269,6 +411,10 @@ def stitch_image_multiple(list_mat, list_overlap, norm=True,
         Enable/disable normalization row-by-row if norm is True.
     total_width : int, optional
         Final width of the stitched image.
+    log_interpolate : bool, optional
+        Use log-space interpolation for sub-pixel shifts (appropriate for log-transformed data). If False, linear interpolation is used.
+    noweighting : bool, optional
+        Skip weighting matrices, use uniform weights.
 
     Returns
     -------
@@ -281,7 +427,8 @@ def stitch_image_multiple(list_mat, list_overlap, norm=True,
         for i in range(1, num_mat):
             (overlap, side) = list_overlap[i - 1][0:2]
             mat_comb = stitch_image(mat_comb, list_mat[i], overlap, side,
-                                    norm=norm, norm_per_row=norm_per_row)
+                                    norm=norm, norm_per_row=norm_per_row,
+                                    log_interpolate=log_interpolate, noweighting=noweighting)
         width = mat_comb.shape[1]
         if total_width is None:
             total_width = width
@@ -293,7 +440,8 @@ def stitch_image_multiple(list_mat, list_overlap, norm=True,
     return np.asarray(mat_comb)
 
 
-def join_image_multiple(list_mat, list_joint, norm=True, total_width=None):
+def join_image_multiple(list_mat, list_joint, norm=True, total_width=None,
+                        log_interpolate=True, interpolate_gap=True):
     """
     Join list of projection images or sinogram images. This is useful for
     fixing the problem of non-overlap between images.
@@ -304,12 +452,16 @@ def join_image_multiple(list_mat, list_joint, norm=True, total_width=None):
         List of 2D array. Projection image or sinogram image.
     list_joint : list of tuple of floats
         List of [joint_width, side].
-        joint_width : Width of the joint area between two images.
+        joint_width : Width of the gap area between two images.
         side : Overlap side between two images.
     norm : bool, optional
         Enable/disable normalization before stitching.
     total_width : int, optional
         Final width of the stitched image.
+    log_interpolate : bool, optional
+        Use log-space interpolation for sub-pixel shifts (appropriate for log-transformed data). If False, linear interpolation is used.
+    interpolate_gap : bool, optional
+        If True (default), interpolate across the gap region using bilinear splines. If False, leave gap as zeros.
 
     Returns
     -------
@@ -322,7 +474,8 @@ def join_image_multiple(list_mat, list_joint, norm=True, total_width=None):
         for i in range(1, num_mat):
             (joint_width, side) = list_joint[i - 1][0:2]
             mat_comb = join_image(mat_comb, list_mat[i], joint_width, side,
-                                  norm=norm)
+                                  norm=norm, log_interpolate=log_interpolate,
+                                  interpolate_gap=interpolate_gap)
         width = mat_comb.shape[1]
         if total_width is None:
             total_width = width
@@ -370,6 +523,7 @@ def convert_sinogram_360_to_180(sino_360, cor, wei_mat1=None, wei_mat2=None,
     cor : float
         Updated center-of-rotation referred to the converted sinogram.
     """
+    log.info("Converting 360-degree sinogram to 180-degree sinogram for cor=%f, sino_360.shape=%s, norm=%s", cor, str(sino_360.shape), str(norm))
     (nrow, ncol) = sino_360.shape
     xcenter = (ncol - 1.0) * 0.5
     nrow_180 = nrow // 2 + 1
@@ -379,10 +533,10 @@ def convert_sinogram_360_to_180(sino_360, cor, wei_mat1=None, wei_mat2=None,
         (overlap, side) = cor
     else:
         if cor <= xcenter:
-            overlap = 2 * cor + 1
+            overlap = 2.0 * cor + 1.0
             side = 0
         else:
-            overlap = 2 * (ncol - cor) - 1
+            overlap = 2.0 * (ncol - cor) - 1.0
             side = 1
     if overlap >= 0:
         sino_stitch = stitch_image(
@@ -397,6 +551,151 @@ def convert_sinogram_360_to_180(sino_360, cor, wei_mat1=None, wei_mat2=None,
         overlap_int = int(np.round(abs(overlap) + 1.0e-3))
         cor = ncol + overlap_int / 2.0 - 0.5
     return sino_stitch, cor
+
+def enhanced_stitch(mat1, mat2, overlap, side, wei_mat1=None, wei_mat2=None,
+                    norm=True, total_width=None, noweighting=False, log_interpolate=True,
+                    interpolate_gap=True):
+    """
+    Enhanced stitching function that handles both overlap and gap cases.
+    For overlap (overlap >= 0): uses stitch_image with center-preserving width adjustment.
+    For gap (overlap < 0): uses join_image with gap interpolation, then center-preserving width adjustment.
+
+    Parameters 
+    ----------
+    mat1 : array_like
+        2D array. Projection image or sinogram image.
+    mat2 :  array_like
+        2D array. Projection image or sinogram image.
+    overlap : float
+        Width of the overlap area (if >= 0) or gap width (if < 0).
+    side : {0, 1}
+        Only two options: 0 or 1. It is used to indicate the overlap/gap side
+        respects to image 1. "0" corresponds to the left side. "1" corresponds
+        to the right side.
+    wei_mat1 : array_like, optional
+        Weighting matrix used for image 1.
+    wei_mat2 : array_like, optional
+        Weighting matrix used for image 2.
+    norm : bool, optional
+        Enable/disable normalization before stitching/joining.
+    total_width : int, optional
+        Final width of the stitched image.
+    noweighting : bool, optional
+        Use mat arrays as they are without weighting (only for overlap case).
+    log_interpolate : bool, optional
+        Use log-space interpolation for sub-pixel shifts (appropriate for log-transformed data). If False, linear interpolation is used.
+    interpolate_gap : bool, optional
+        If True, interpolate across gap region using bilinear splines (for gap case).
+
+    Returns
+    -------
+    array_like
+        Stitched image.
+    """
+    if overlap >= 0:
+        # Overlap case: use stitch_image with center-preserving width adjustment
+        stitched_image = stitch_image(mat1, mat2, overlap, side, wei_mat1, wei_mat2, 
+                                      norm=norm, total_width=None, noweighting=noweighting, 
+                                      log_interpolate=log_interpolate)
+    else:
+        # Gap case: use join_image with gap interpolation, then center-preserving width adjustment
+        gap_width = abs(overlap)
+        stitched_image = join_image(mat1, mat2, gap_width, side,
+                                    norm=norm, total_width=None,
+                                    log_interpolate=log_interpolate,
+                                    interpolate_gap=interpolate_gap)
+    
+    # Adjust the total width to keep the center in the center
+    if total_width is not None and total_width != stitched_image.shape[1]:
+        log.info(f"Adjusting stitched image width from {stitched_image.shape[1]} to {total_width} while preserving the center of rotation offset relative to the center of the stitched image.")
+        current_width = stitched_image.shape[1]
+        if total_width > current_width:
+            pad_width = total_width - current_width
+            left_pad = pad_width // 2
+            right_pad = pad_width - left_pad
+            stitched_image = np.pad(stitched_image, ((0, 0), (left_pad, right_pad)), mode='edge')
+            if left_pad < right_pad:
+                log.info("Shifting extended image by 0.5 pixel to the right to keep center aligned.")
+                stitched_image = shiftFrameFloat(stitched_image, 0.5, log_interpolate=log_interpolate)
+        else:
+            diff = current_width - total_width
+            left_crop = diff // 2
+            right_crop = diff - left_crop
+            if left_crop < right_crop:
+                log.info("Shifting stitched image by 0.5 pixel to the right before cropping to keep center aligned.")
+                stitched_image = shiftFrameFloat(stitched_image, 0.5, log_interpolate=log_interpolate)
+            stitched_image = stitched_image[:, left_crop:current_width - right_crop]
+    return stitched_image
+
+def convert_sinogram_360_to_180_enh(sino_360, cor, wei_mat1=None, wei_mat2=None,
+                                norm=True, total_width=None, noweighting=False,
+                                log_interpolate=True, interpolate_gap=True):
+    """
+    Convert a 360-degree sinogram to a 180-degree sinogram (enhanced version).
+
+    This enhanced version always uses enhanced_stitch which internally decides
+    whether to use stitch_image (overlap) or join_image (gap), and handles
+    center-preserving width adjustment in both cases.
+
+    Parameters
+    ----------
+    sino_360 : array_like
+        2D array. 360-degree sinogram.
+    cor : float or tuple of float
+        Center-of-rotation or (Overlap_area, overlap_side).
+    wei_mat1 : array_like, optional
+        Weighting matrix used for the 1st half of the sinogram.
+    wei_mat2 : array_like, optional
+        Weighting matrix used for the 2nd half of the sinogram.
+    norm : bool, optional
+        Enable/disable normalization before stitching/joining.
+    total_width : int, optional
+        Final width of the stitched image.
+    noweighting : bool, optional
+        Use mat arrays as they are without weighting.
+    log_interpolate : bool, optional
+        Use log-space interpolation for sub-pixel shifts (appropriate for log-transformed data).
+    interpolate_gap : bool, optional
+        Interpolate across gap region when using join_image.
+
+    Returns
+    -------
+    sino_stitch : array_like
+        Converted sinogram.
+    cor : float
+        Updated center-of-rotation referred to the converted sinogram.
+    """
+    log.info("Converting 360-degree sinogram to 180-degree sinogram (enhanced) for cor=%f, sino_360.shape=%s, norm=%s", cor, str(sino_360.shape), str(norm))
+    (nrow, ncol) = sino_360.shape
+    xcenter = (ncol - 1.0) * 0.5
+    nrow_180 = nrow // 2 + 1
+    sino_top = sino_360[0:nrow_180, :]
+    sino_bot = np.fliplr(sino_360[-nrow_180:, :])
+    
+    if isinstance(cor, tuple):
+        (overlap, side) = cor
+    else:
+        if cor <= xcenter:
+            overlap = 2.0 * cor + 1.0
+            side = 0
+        else:
+            overlap = 2.0 * (ncol - cor) - 1.0
+            side = 1
+    
+    # Always use enhanced_stitch which handles both overlap and gap cases internally
+    sino_stitch = enhanced_stitch(
+        sino_top, sino_bot, overlap, side, wei_mat1=wei_mat1,
+        wei_mat2=wei_mat2, norm=norm, total_width=total_width,
+        noweighting=noweighting, log_interpolate=log_interpolate,
+        interpolate_gap=interpolate_gap)
+    
+    # enhanced_stitch always center-aligns the output, so COR is simply the center
+    cor_updated = sino_stitch.shape[1] * 0.5 - 0.5
+
+    if total_width is not None and total_width != sino_stitch.shape[1]:
+        raise ValueError("Total width=%d is different from stitched image width=%d"
+                         % (total_width, sino_stitch.shape[1]))
+    return sino_stitch, cor_updated
 
 
 def convert_sinogram_180_to_360(sino_180, center):
@@ -427,7 +726,7 @@ def convert_sinogram_180_to_360(sino_180, center):
     return np.vstack((sino_180, sino_flip[1:]))
 
 
-def extend_sinogram(sino_360, cor, apply_log=True):
+def extend_sinogram(sino_360, cor, apply_log=True, log_interpolate=True):
     """
     Extend a 360-degree sinogram (with offset center-of-rotation) for
     later reconstruction (Ref. [1]).
@@ -441,6 +740,8 @@ def extend_sinogram(sino_360, cor, apply_log=True):
         The CoR can be outside the field of view (CoR<0 or CoR>sinogram-width).
     apply_log : bool, optional
         Apply the logarithm function if True.
+	log_interpolate: bool, optional
+		Use log-space interpolation for sub-pixel shifts (appropriate for log-transformed data).
 
     Returns
     -------
@@ -467,43 +768,66 @@ def extend_sinogram(sino_360, cor, apply_log=True):
         (overlap, side) = cor
     else:
         if cor <= xcenter:
-            overlap = 2 * cor + 1
+            overlap = 2.0 * cor + 1.0
             side = 0
         else:
-            overlap = 2 * (ncol - cor) - 1
+            overlap = 2.0 * (ncol - cor) - 1.0
             side = 1
+    overlap_int = int(np.floor(overlap))
+    sub_pixel = overlap - overlap_int
     if overlap >= 0:
-        overlap_int = int(np.round(overlap + 1.0e-3))
-        sub_pixel = overlap - overlap_int
-        cor_updated = ncol - overlap_int / 2.0 - 0.5
-    else:
-        overlap = abs(overlap)
-        overlap_int = int(np.round(overlap + 1.0e-3))
-        sub_pixel = overlap - overlap_int
-        cor_updated = ncol + overlap_int / 2.0 - 0.5
+        # Overlap case: stitch the two halves
         if side == 1:
-            sino_360 = np.pad(sino_360, ((0, 0), (0, overlap_int)),
-                              mode='edge')
+            if sub_pixel > 0.0:
+                sino_360 = shiftFrameFloat(sino_360, sub_pixel / 2.0, log_interpolate)
+            wei_list = np.linspace(1.0, 0.0, overlap_int)
+            wei_mat = np.tile(wei_list, (nrow, 1))
+            sino_360[:, -overlap_int:] = sino_360[:, -overlap_int:] * wei_mat
+            pad_wid = ncol - overlap_int
+            sino_pad = np.pad(sino_360, ((0, 0), (0, pad_wid)), mode='edge')
+            cor_updated = ncol - overlap_int / 2.0 - 0.5
         else:
-            sino_360 = np.pad(sino_360, ((0, 0), (overlap_int, 0)),
-                              mode='edge')
-        ncol = sino_360.shape[-1]
-    if side == 1:
-        if sub_pixel != 0.0:
-            sino_360 = shift(sino_360, (0, sub_pixel), mode='nearest')
-        wei_list = np.linspace(1.0, 0.0, overlap_int)
-        wei_mat = np.tile(wei_list, (nrow, 1))
-        sino_360[:, -overlap_int:] = sino_360[:, -overlap_int:] * wei_mat
-        pad_wid = ncol - overlap_int
-        sino_pad = np.pad(sino_360, ((0, 0), (0, pad_wid)), mode='edge')
+            if sub_pixel > 0.0:
+                sino_360 = shiftFrameFloat(sino_360, -sub_pixel / 2.0, log_interpolate)
+            wei_list = np.linspace(0.0, 1.0, overlap_int)
+            wei_mat = np.tile(wei_list, (nrow, 1))
+            sino_360[:, :overlap_int] = sino_360[:, :overlap_int] * wei_mat
+            pad_wid = ncol - overlap_int
+            sino_pad = np.pad(sino_360, ((0, 0), (pad_wid, 0)), mode='edge')
+            cor_updated = ncol - overlap_int / 2.0 - 0.5
     else:
-        if sub_pixel != 0.0:
-            sino_360 = shift(sino_360, (0, -sub_pixel), mode='nearest')
-        wei_list = np.linspace(0.0, 1.0, overlap_int)
-        wei_mat = np.tile(wei_list, (nrow, 1))
-        sino_360[:, :overlap_int] = sino_360[:, :overlap_int] * wei_mat
-        pad_wid = ncol - overlap_int
-        sino_pad = np.pad(sino_360, ((0, 0), (pad_wid, 0)), mode='edge')
+        # Gap case: CoR outside FOV, pad then join
+        overlap = abs(overlap)
+        overlap_int = int(np.floor(overlap))
+        sub_pixel = overlap - overlap_int
+        if side == 1:
+            if sub_pixel > 0.0:
+                sino_360 = shiftFrameFloat(sino_360, -sub_pixel / 2.0, log_interpolate)
+            sino_360 = np.pad(sino_360, ((0, 0), (0, overlap_int)), mode='edge')
+        else:
+            if sub_pixel > 0.0:
+                sino_360 = shiftFrameFloat(sino_360, sub_pixel / 2.0, log_interpolate)
+            sino_360 = np.pad(sino_360, ((0, 0), (overlap_int, 0)), mode='edge')
+        ncol = sino_360.shape[-1]
+        if side == 1:
+            if sub_pixel > 0.0:
+                # Already shifted above
+                pass
+            wei_list = np.linspace(1.0, 0.0, overlap_int)
+            wei_mat = np.tile(wei_list, (nrow, 1))
+            sino_360[:, -overlap_int:] = sino_360[:, -overlap_int:] * wei_mat
+            pad_wid = ncol - overlap_int
+            sino_pad = np.pad(sino_360, ((0, 0), (0, pad_wid)), mode='edge')
+            cor_updated = ncol + overlap_int / 2.0 - 0.5
+        else:
+            if sub_pixel > 0.0:
+                pass
+            wei_list = np.linspace(0.0, 1.0, overlap_int)
+            wei_mat = np.tile(wei_list, (nrow, 1))
+            sino_360[:, :overlap_int] = sino_360[:, :overlap_int] * wei_mat
+            pad_wid = ncol - overlap_int
+            sino_pad = np.pad(sino_360, ((0, 0), (pad_wid, 0)), mode='edge')
+            cor_updated = ncol + overlap_int / 2.0 - 0.5
     return 2 * sino_pad, cor_updated
 
 
